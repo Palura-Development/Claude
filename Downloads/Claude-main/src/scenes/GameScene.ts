@@ -444,9 +444,6 @@ export default class GameScene extends Phaser.Scene {
     // Add P key to release hook and drop from suspension
     this.releaseHookKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.P);
 
-    // Add Enter key for game over review panel (created ONCE, not in update loop)
-    this.gameOverReviewEnterKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.ENTER);
-
     // Setup voice recognition based on mic test results
     this.time.delayedCall(500, () => {
       this.setupVoiceRecognitionFromTest();
@@ -1940,10 +1937,8 @@ export default class GameScene extends Phaser.Scene {
       this.deaths++;
       console.log(`💀 Death count: ${this.deaths} (died during spell attempt)`);
       
-      // If 4 or more deaths during spell attempts, show game over review
       if (this.deaths >= 4) {
         this.jumufGameOverReview();
-        return; // Don't respawn yet, wait for Enter key
       }
     }
     
@@ -3071,8 +3066,18 @@ export default class GameScene extends Phaser.Scene {
       // Show valid feedback
       this.showValidFeedback(letterText);
 
-      // Collect the letter for this zone (slot-based, universal)
-      this.collectHookZoneLetter(letter);
+      // Collect the letter for this zone (strict sequential order enforced)
+      const letterAccepted = this.collectHookZoneLetter(letter);
+
+      // If the letter was rejected (wrong order), show a shake/red flash and bail out
+      if (!letterAccepted) {
+        // Brief red flash on the node to signal wrong order
+        letterText.setTint(0xef4444);
+        this.time.delayedCall(300, () => {
+          letterText.clearTint();
+        });
+        return;
+      }
 
       // Check if word is NOW complete after collecting this letter
       const targetWord = this.hookZoneTargetWord || '';
@@ -3369,24 +3374,26 @@ export default class GameScene extends Phaser.Scene {
 
   private checkSpellWordCompletion(newLetter: string) {
     let letterWasUseful = false;
-    
-    // Check each incomplete word to see if this letter completes it
+
+    // Check each incomplete word to see if this letter is the NEXT expected letter in sequence
     this.incompleteWords.forEach((wordData, index) => {
-      if (wordData.missingLetters.includes(newLetter)) {
+      // Only accept the letter if it matches the next missing letter in order
+      const nextExpected = wordData.missingLetters[0];
+      if (nextExpected && nextExpected === newLetter) {
         letterWasUseful = true;
-        // Remove the found letter from missing letters
-        wordData.missingLetters = wordData.missingLetters.filter(letter => letter !== newLetter);
-        
+        // Remove the first (next expected) missing letter
+        wordData.missingLetters = wordData.missingLetters.slice(1);
+
         // Check if word is now complete
         if (wordData.missingLetters.length === 0) {
           console.log(`✨ SPELL WORD COMPLETED: ${wordData.word}!`);
-          
+
           // Add to completed spell words
           this.completedSpellWords.push(wordData.word);
-          
+
           // Remove from incomplete words
           this.incompleteWords.splice(index, 1);
-          
+
           // Show completion effect
           this.showSpellWordCompleted(wordData.word);
         }
@@ -5736,32 +5743,6 @@ export default class GameScene extends Phaser.Scene {
       this.pronunciationDoor.update();
     }
 
-    // Handle game over review Enter key
-    if (this.gameOverReviewActive && this.gameOverReviewEnterKey) {
-      if (Phaser.Input.Keyboard.JustDown(this.gameOverReviewEnterKey)) {
-        // Clean up review panel
-        if (this.gameOverReviewPanel) {
-          this.gameOverReviewPanel.panelBg.destroy();
-          this.gameOverReviewPanel.panelBorder.destroy();
-          this.gameOverReviewPanel.titleText.destroy();
-          this.gameOverReviewPanel.contentText.destroy();
-          this.gameOverReviewPanel.enterText.destroy();
-          this.gameOverReviewPanel = undefined;
-        }
-        
-        this.hideJumuf();
-        
-        // Reset death count
-        this.deaths = 0;
-        this.diedDuringSpell = false;
-        this.lastFailedSpell = undefined;
-        
-        // Respawn player
-        this.handleHazardHit();
-        
-        this.gameOverReviewActive = false;
-      }
-    }
 
     // Update attack cooldown
     if (this.attackCooldown > 0) {
@@ -6649,9 +6630,9 @@ export default class GameScene extends Phaser.Scene {
    * Word-agnostic: works for ANY word (BLAZE, FROST, STORM, etc.)
    * Slot-based: tracks which positions are filled, handles any click order
    */
-  private collectHookZoneLetter(letter: string) {
-    if (!this.isInHookZone || this.currentHookZoneIndex < 0) return;
-    if (!this.hookZoneTargetWord) return;
+  private collectHookZoneLetter(letter: string): boolean {
+    if (!this.isInHookZone || this.currentHookZoneIndex < 0) return false;
+    if (!this.hookZoneTargetWord) return false;
 
     const targetWord = this.hookZoneTargetWord;
     // Initialize slot state if needed
@@ -6660,44 +6641,30 @@ export default class GameScene extends Phaser.Scene {
       this.hookZoneFilledLetters = new Array(targetWord.length).fill('');
     }
 
-    // Find the FIRST position where this letter appears in the target word (left-to-right)
-    // (handles duplicate letters like "FREEZE" with two E's)
-    let letterUsed = false;
-    let slotFilled = -1;
-    for (let i = 0; i < targetWord.length; i++) {
-      if (targetWord[i] === letter && !this.hookZoneSlotState[i]) {
-        // Fill this slot
-        this.hookZoneSlotState[i] = true;
-        this.hookZoneFilledLetters[i] = letter;
-        letterUsed = true;
-        slotFilled = i;
-        break; // Only fill one slot per click (for duplicate letters)
-      }
+    // Find the next unfilled slot (strict left-to-right order enforcement)
+    const nextSlot = this.hookZoneSlotState.indexOf(false);
+    if (nextSlot === -1) return false; // All slots already filled
+
+    const expectedLetter = targetWord[nextSlot];
+
+    // Only accept the letter if it is the next expected letter in sequence
+    if (letter !== expectedLetter) {
+      // Wrong order or wrong letter — reject without filling any slot
+      return false;
     }
 
-    // If letter didn't match any slot (fake/distraction letter), fill the next empty slot with the wrong letter
-    if (!letterUsed) {
-      for (let i = 0; i < targetWord.length; i++) {
-        if (!this.hookZoneSlotState[i]) {
-          this.hookZoneSlotState[i] = true;
-          this.hookZoneFilledLetters[i] = letter; // Wrong letter in slot
-          letterUsed = true;
-          slotFilled = i;
-          break;
-        }
-      }
-    }
-
-    // Track collected letter (for tracking which letters have been used)
-    if (letterUsed) {
-      this.hookZoneCollectedLetters.push(letter);
-    }
+    // Correct letter in correct order — fill the slot
+    this.hookZoneSlotState[nextSlot] = true;
+    this.hookZoneFilledLetters[nextSlot] = letter;
+    this.hookZoneCollectedLetters.push(letter);
 
     // Update the hangman UI
     this.updateHookZoneUI();
 
     // Check for word completion
     this.checkHookZoneCompletion();
+
+    return true;
   }
 
   /**
@@ -10298,97 +10265,11 @@ export default class GameScene extends Phaser.Scene {
   }
 
   private jumufGameOverReview() {
-    if (!this.jumuf) return;
-
-    // Show Jumuf in center
-    this.showJumuf();
-    this.jumuf.setPosition(400, 200);
-    this.jumuf.setDepth(200);
-
-    // Create full-screen review panel
-    const panelBg = this.add.rectangle(400, 300, 600, 400, 0x1f2937, 0.95)
-      .setDepth(199)
-      .setScrollFactor(0);
-
-    const panelBorder = this.add.rectangle(400, 300, 600, 400, 0x8b5cf6, 0)
-      .setStrokeStyle(4, 0x8b5cf6, 1)
-      .setDepth(199)
-      .setScrollFactor(0);
-
-    // Title
-    const titleText = this.add.text(400, 150, '💫 Jumuf\'s Review 💫', {
-      fontFamily: 'monospace',
-      fontSize: '28px',
-      color: '#fbbf24',
-      stroke: '#000000',
-      strokeThickness: 3
-    }).setOrigin(0.5).setDepth(201).setScrollFactor(0);
-
-    // Review content
-    let reviewText = 'You\'ve been struggling, friend.\n\n';
-    
-    if (this.lastFailedSpell) {
-      reviewText += `The word you tried to pronounce: "${this.lastFailedSpell}"\n\n`;
-      reviewText += `Correct pronunciation: "${this.lastFailedSpell}"\n\n`;
-      reviewText += 'Tips:\n';
-      reviewText += '• Speak clearly and slowly\n';
-      reviewText += '• Make sure your microphone is working\n';
-      reviewText += '• Try saying the word syllable by syllable\n';
-    } else {
-      reviewText += 'You\'ve died multiple times.\n\n';
-      reviewText += 'Remember:\n';
-      reviewText += '• Use your spells wisely\n';
-      reviewText += '• Watch out for enemies\n';
-      reviewText += '• Take your time with traversal\n';
-    }
-
-    const contentText = this.add.text(400, 300, reviewText, {
-      fontFamily: 'monospace',
-      fontSize: '16px',
-      color: '#ffffff',
-      align: 'center',
-      wordWrap: { width: 550 }
-    }).setOrigin(0.5).setDepth(201).setScrollFactor(0);
-
-    // Press Enter instruction
-    const enterText = this.add.text(400, 450, 'Press ENTER to continue', {
-      fontFamily: 'monospace',
-      fontSize: '18px',
-      color: '#8b5cf6',
-      stroke: '#000000',
-      strokeThickness: 2
-    }).setOrigin(0.5).setDepth(201).setScrollFactor(0);
-
-    // Blink animation for Enter text
-    this.tweens.add({
-      targets: enterText,
-      alpha: 0.5,
-      duration: 800,
-      yoyo: true,
-      repeat: -1,
-      ease: 'Sine.easeInOut'
-    });
-
-    // Store review panel elements for cleanup
-    this.gameOverReviewPanel = {
-      panelBg,
-      panelBorder,
-      titleText,
-      contentText,
-      enterText
-    };
-    this.gameOverReviewActive = true;
+    this.deaths = 0;
+    this.diedDuringSpell = false;
+    this.lastFailedSpell = undefined;
+    this.handleHazardHit();
   }
-
-  private gameOverReviewActive = false;
-  private gameOverReviewEnterKey?: Phaser.Input.Keyboard.Key;
-  private gameOverReviewPanel?: {
-    panelBg: Phaser.GameObjects.Rectangle;
-    panelBorder: Phaser.GameObjects.Rectangle;
-    titleText: Phaser.GameObjects.Text;
-    contentText: Phaser.GameObjects.Text;
-    enterText: Phaser.GameObjects.Text;
-  };
 
   // PronunciationDoor system
   private pronunciationDoor?: PronunciationDoor;
